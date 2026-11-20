@@ -1,5 +1,18 @@
 ![atk-logo](./img/logo.png)
 
+## 后台采集工具与技能
+
+本仓库包含独立运行的 ATK-Logic 命令行工具和 Python API。Windows 推荐从项目自己的 Python 虚拟环境运行 `atk-logic-cli.exe`。它可在后台配置和采集 DL16，并导出 `.atkdl`、变化点 CSV 和 VCD。Windows 上已实测三路 10 MHz × 10 秒和三路 100 MHz × 10 秒 RLE。 [安装、命令及验收范围](api/README.md)
+
+- `api/` 包含命令行、Python API、测试和 [JR 三路预设](api/presets/jr-three-channel.json)。
+- 在 Codex 打开本仓库，可通过 `$atk-logic` 调用项目技能，例如 `$atk-logic 使用 JR 三路预设采集并导出 .atkdl`。 [Codex 项目技能](.agents/skills/atk-logic/SKILL.md)
+- 可将技能目录放到 `~/.agents/skills/atk-logic/` 供其他项目使用，Windows 路径为 `%USERPROFILE%\.agents\skills\atk-logic\`。跨项目调用时让 `atk-logic-cli` 可从 PATH 找到，或指定工具检出目录。 [Codex 技能文档](https://developers.openai.com/codex/skills#where-codex-loads-local-skills)
+- [`.claude/skills/atk-logic/`](.claude/skills/atk-logic/SKILL.md) 是调用这个工具的 Claude Code 技能。从仓库中使用 Claude Code 时可直接发现。需要在其他项目使用时，只需将 `atk-logic` 技能目录复制到用户的 `.claude/skills/`，工具仍从原项目运行。
+
+## 项目来源
+
+本仓库继承正点原子 ATK-Logic 的上位机源码，并在 huatanshaonian 社区分支提供的 Python API 和 CLI 上继续开发。原有提交历史和 GPL-3.0-or-later 许可随仓库保留。 [原厂源码](https://github.com/alientek-openedv/atk-logic) · [社区分支](https://github.com/huatanshaonian/atk-logic) · [许可证](COPYING)
+
 
 软件简介(ATK-Logic)
 -----------------------
@@ -42,17 +55,6 @@ sudo linux/install.sh      # 可选：安装到 /opt/ATK-Logic，并安装 USB �
 ```
 
 详见 [linux/README.md](linux/README.md)。
-
-
-跨平台 Python API / 命令行 / Claude Code 技能
------------------------
-
-`api/` 目录提供不依赖上位机的 Python 接口和 `atk-logic` 命令行工具（Windows 与 Linux 通用），
-可采集、触发、输出 PWM、读取 `.atkdl` 工程文件、导出 VCD/CSV，并用 `runtime/decoders` 中的
-sigrok 解码器做协议解码，见 [api/README.md](api/README.md)。
-
-`.claude/skills/atk-logic/` 是基于该工具的 Claude Code 技能：在本仓库中启动 Claude Code 即可使用；
-如需在任意目录使用，把该目录复制到 `~/.claude/skills/`（Windows 为 `%USERPROFILE%\.claude\skills\`）。
 
 
 版权许可
