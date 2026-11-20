@@ -58,6 +58,8 @@ class CaptureError(AtkError):
 class Transport:
     """Minimal interface the device logic needs (real USB or a test fake)."""
 
+    stream_error: Optional[str] = None
+
     def write(self, data: bytes, timeout_ms: int = 1000) -> None:
         raise NotImplementedError
 
@@ -140,14 +142,13 @@ class UsbTransport(Transport):
         self._ctx.open()
         self._handle = None
         self._claimed = False
-        self._q: "queue.Queue[bytes]" = queue.Queue()
+        self._q: "queue.Queue[bytes]" = queue.Queue(maxsize=128)
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._pending = 0
         self._lock = threading.Lock()
         self._transfers = []
         self._no_device = False
-        self.stream_error: Optional[str] = None
         try:
             devs = [d for d in self._ctx.getDeviceIterator(skip_on_error=True)
                     if d.getVendorID() == P.VENDOR_ID and d.getProductID() == P.PRODUCT_ID]
@@ -164,6 +165,8 @@ class UsbTransport(Transport):
             self.bus, self.address, self.port = dev.getBusNumber(), dev.getDeviceAddress(), dev.getPortNumber()
             try:
                 self._handle = dev.open()
+            except usb1.USBErrorBusy as e:
+                raise DeviceAccessError("the analyzer is in use by another program (%s)" % e)
             except usb1.USBErrorAccess as e:
                 raise DeviceAccessError("permission denied opening the analyzer (%s)" % e, _access_hint())
             except (usb1.USBErrorNotSupported, usb1.USBErrorNotFound) as e:
@@ -180,7 +183,7 @@ class UsbTransport(Transport):
             except usb1.USBErrorBusy as e:
                 raise DeviceAccessError("the analyzer is in use by another program (%s)" % e,
                                         "Close the ATK-Logic GUI or other scripts using the device.")
-            except usb1.USBErrorAccess as e:
+            except usb1.USBError as e:
                 raise DeviceAccessError("cannot claim the USB interface (%s)" % e, _access_hint())
         except Exception:
             self.close()
@@ -197,6 +200,8 @@ class UsbTransport(Transport):
         except u.USBErrorTimeout:
             raise DeviceStateError("USB write timed out",
                                    "Re-plug the analyzer; if it persists, update firmware with the official GUI.")
+        except u.USBError as e:
+            raise DeviceStateError("USB write failed: %s" % e) from e
 
     def read(self, length: int, timeout_ms: int) -> bytes:
         u = self._u
@@ -209,6 +214,8 @@ class UsbTransport(Transport):
             return b""
         except u.USBErrorOverflow:
             return b""
+        except u.USBError as e:
+            raise DeviceStateError("USB read failed: %s" % e) from e
 
     # -- async streaming ----------------------------------------------
     def _cb(self, t):
@@ -217,8 +224,11 @@ class UsbTransport(Transport):
         if st in (u.TRANSFER_COMPLETED, u.TRANSFER_TIMED_OUT):
             n = t.getActualLength()
             if n > 0:
-                self._q.put(bytes(t.getBuffer()[:n]))
-            if self._running:
+                try:
+                    self._q.put_nowait(bytes(t.getBuffer()[:n]))
+                except queue.Full:
+                    self.stream_error = self.stream_error or "host USB receive queue overflow"
+            if self._running and self.stream_error is None:
                 try:
                     t.submit()
                     return
@@ -226,8 +236,10 @@ class UsbTransport(Transport):
                     self.stream_error = "resubmit failed: %s" % e
         elif st == u.TRANSFER_NO_DEVICE:
             self._no_device = True
+        elif st == u.TRANSFER_OVERFLOW:
+            self.stream_error = self.stream_error or "USB transfer overflow"
         elif st != u.TRANSFER_CANCELLED:
-            self.stream_error = "transfer status %s" % st
+            self.stream_error = self.stream_error or "transfer status %s" % st
         with self._lock:
             self._pending -= 1
 
@@ -239,12 +251,14 @@ class UsbTransport(Transport):
                 break
             try:
                 self._ctx.handleEventsTimeout(tv=0.05)
+            except self._u.USBErrorInterrupted:
+                continue
             except Exception as e:  # noqa: BLE001
-                self.stream_error = str(e)
+                self.stream_error = self.stream_error or str(e)
                 break
 
     def stream_start(self, n_transfers: int, size: int, timeout_ms: int) -> None:
-        self._q = queue.Queue()
+        self._q = queue.Queue(maxsize=self._q.maxsize)
         self._running = True
         self.stream_error = None
         self._transfers = []
@@ -253,7 +267,11 @@ class UsbTransport(Transport):
             t.setBulk(P.EP_IN, size, callback=self._cb, timeout=timeout_ms)
             self._transfers.append(t)
         for t in self._transfers:
-            t.submit()
+            try:
+                t.submit()
+            except self._u.USBError as e:
+                self.stream_error = "USB transfer submission failed: %s" % e
+                break
             with self._lock:
                 self._pending += 1
         self._thread = threading.Thread(target=self._loop, name="atk-usb-events", daemon=True)
@@ -321,6 +339,7 @@ class DeviceInfo:
     channels: int = P.CHANNEL_COUNT
     bus: Optional[int] = None
     address: Optional[int] = None
+    min_app_version: int = 0
 
     @property
     def plus(self) -> bool:
@@ -375,12 +394,18 @@ class AtkLogic:
         self._log = log or (lambda msg: None)
         self._pwm_on = [False, False]
         self._fpga_awake = False
+        self._start_payload_tail = b""
         self._sleep = time.sleep
         self.silence_timeout_s = 2.5  # GUI: ~20 x 100 ms without packets -> "应答超时"
         if connect:
             try:
                 self.connect()
             except Exception:
+                if self._fpga_awake and not self.t.no_device:
+                    try:
+                        self.set_reset_state(0)
+                    except AtkError:
+                        pass
                 self.t.close()
                 raise
 
@@ -422,14 +447,17 @@ class AtkLogic:
         self._fpga_awake = bool(state)
 
     def _fpga_active(self) -> None:
-        self.set_reset_state(1)
-        self._read_sync()
+        if not self._fpga_awake:
+            self.set_reset_state(1)
+            self._read_sync()
 
     # ------------------------------------------------------------ connect
     def connect(self, max_attempts: int = 5) -> DeviceInfo:
         """Handshake (ConnectDevice::CheckDeviceCreanInfo)."""
         self._sleep(0.3)
         name, usb, mcu, fpga, hw, level = "", "NULL", 0, 0, 0, 0
+        min_app_version = 0
+        self._start_payload_tail = b""
         count = 0
         while True:
             # flush stale data, detect a device stuck in bootloader mode
@@ -489,11 +517,19 @@ class AtkLogic:
                             raise DeviceStateError(
                                 "FPGA firmware %d is older than required %d" % (fpga, P.FPGA_MIN_VERSION_NUM),
                                 "Update the firmware with the official ATK-Logic GUI.")
-                        if P.APP_VERSION_NUM < fi.min_app_version:
+                        min_app_version = fi.min_app_version
+                        # This exact DL16 handshake has been verified on USB with both capture modes.
+                        verified_dl16 = (fi.name, usb, hw, level, mcu, fpga, min_app_version) == (
+                            "DL16", "2.0", 2, 0, 19, 222, 1108)
+                        if P.APP_VERSION_NUM < min_app_version and not verified_dl16:
                             raise DeviceStateError(
-                                "firmware requires host software >= %d (this API implements %d)"
-                                % (fi.min_app_version, P.APP_VERSION_NUM),
-                                "The protocol may have changed; check for an updated API.")
+                                "unverified %s firmware: hardware %d, MCU %d, FPGA %d, minimum host %d"
+                                % (fi.name, hw, mcu, fpga, min_app_version),
+                                "Use an updated API or the official ATK-Logic application.")
+                        if verified_dl16:
+                            # The 1.1.x format has an additional trailing zero.
+                            # FPGA 222 rejects the legacy form on the 100 MSa/ch Buffer request.
+                            self._start_payload_tail = b"\x00"
                         name = fi.name
                         break
             self._sleep(0.3)
@@ -513,7 +549,8 @@ class AtkLogic:
         self.set_reset_state(0)
         self._read_sync()
         self.info = DeviceInfo(name, usb, mcu, fpga, hw, level,
-                               bus=getattr(self.t, "bus", None), address=getattr(self.t, "address", None))
+                               bus=getattr(self.t, "bus", None), address=getattr(self.t, "address", None),
+                               min_app_version=min_app_version)
         return self.info
 
     # ---------------------------------------------------------------- PWM
@@ -595,10 +632,13 @@ class AtkLogic:
             t = P.normalize_trigger(v)
             if t != "none":
                 trig[k] = t
-        if trig and mode == "stream":
-            raise ValueError("triggers are only available in buffer mode (the GUI disables them in stream mode)")
         if not 1 <= float(trigger_position) <= 90:
             raise ValueError("trigger_position must be 1..90 %")
+        # The GUI disables pre-trigger position in Stream. Send the default,
+        # and use any trigger position reported by the device in the result.
+        trigger_position = 1.0 if mode == "stream" else float(trigger_position)
+        if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+            raise ValueError("timeout must be a finite positive number of seconds")
         thr = parse_threshold(threshold)
         P.encode_threshold(thr)
         return CaptureConfig(chans, rate, depth, thr, mode, bool(rle), trig,
@@ -608,7 +648,7 @@ class AtkLogic:
                 duration: Optional[float] = None, threshold: Union[str, float, None] = None,
                 mode: str = "buffer", rle: bool = False, trigger: Optional[Dict[int, str]] = None,
                 trigger_position: float = 1.0, timeout: Optional[float] = None,
-                progress=None) -> Capture:
+                progress=None, *, stop_event=None, immediate: Optional[bool] = None) -> Capture:
         """Acquire samples.
 
         channels:   iterable of channel numbers 0..15
@@ -619,77 +659,111 @@ class AtkLogic:
                     'stream' (continuous USB streaming, <=100 MHz, rate*channels<=320 MHz)
         rle:        hardware run-length compression
         trigger:    {channel: 'rising'|'falling'|'high'|'low'|'edge'}; empty = start immediately
-        trigger_position: percent of the buffer before the trigger (1..90)
-        timeout:    seconds to wait for the trigger/data (None = wait for ever; Ctrl+C to abort)
+        trigger_position: percent of the buffer before the trigger (1..90, Buffer only)
+        timeout:    capture deadline in seconds, separate from the USB inactivity limit
+        stop_event: optional event checked during acquisition, equivalent to Ctrl+C
+        immediate:  True bypasses triggers, False uses ordinary start, None infers from trigger settings
         """
         cfg = self.build_config(channels, samplerate, samples, duration, threshold, mode, rle,
                                 trigger, trigger_position, timeout)
-        return self.capture_config(cfg, progress)
+        return self.capture_config(cfg, progress, stop_event=stop_event, immediate=immediate)
 
-    def capture_config(self, cfg: CaptureConfig, progress=None) -> Capture:
+    def capture_config(self, cfg: CaptureConfig, progress=None, *, stop_event=None,
+                       immediate: Optional[bool] = None) -> Capture:
         is_buffer = cfg.mode == "buffer"
         depth = cfg.depth
-        trig_depth = P.trigger_depth(depth, cfg.trigger_position) if is_buffer else 0
+        trig_depth = P.trigger_depth(depth, cfg.trigger_position if is_buffer else 1.0)
         settings = P.encode_settings(is_buffer, cfg.rle, cfg.threshold_v, cfg.samplerate, depth, trig_depth)
-        instant = not cfg.triggers
-        trig_bytes = P.encode_trigger(cfg.channels, cfg.triggers, instant)
+        instant = not cfg.triggers if immediate is None else immediate
+        trig_bytes = P.encode_trigger(cfg.channels, cfg.triggers, instant) + self._start_payload_tail
         seconds = depth / cfg.samplerate
         n_xfer = P.read_transfer_count(depth, len(cfg.channels), seconds)
         warnings: List[str] = []
 
-        # --- Session::OrderStart
-        self._fpga_active()
-        self._drain(1000)
-        self._fpga(P.CMD_PARAMETER_SETTING, settings)
-        self._sleep(0.03)  # FPGA needs time to settle the threshold voltage
-        start_time = datetime.datetime.now()
-        self._fpga(P.CMD_SIMPLE_TRIGGER, trig_bytes)
-
         # --- ThreadWork::DeviceRecvThread
         parser = P.PacketParser()
         n_ch = P.CHANNEL_COUNT
-        data: Dict[int, List[bytes]] = {c: [] for c in cfg.channels}
+        data = {c: bytearray() for c in cfg.channels}
         got = {c: 0 for c in range(n_ch)}  # bytes appended per channel
         offsets = [0] * n_ch  # start offset (bits) still to drop
         trigger_pos = 0
         offset_seen = False
-        exceed_capacity = exceed_bandwidth = False
-        state = "running"  # running | done | stopped | timeout | error | nodevice
+        exceed_capacity = exceed_bandwidth = host_overflow = False
+        armed = False
+        state, reason = "running", None
         error = None
-        t0 = time.monotonic()
-        last_packet = time.monotonic()
-        silence_limit = self.silence_timeout_s
-        triggered = not is_buffer or instant
+        start_time = datetime.datetime.now()
+        t0 = last_packet = time.monotonic()
+        triggered = instant or not cfg.triggers
         last_prog = -1
+        start_sent = stream_started = False
 
-        self.t.stream_start(n_xfer, P.READ_TRANSFER_SIZE, 1200)
+        def mark_armed():
+            nonlocal armed
+            if not armed:
+                armed = True
+                if progress:
+                    progress("armed", 0)
+
         try:
+            # --- Session::OrderStart
+            if stop_event is not None and stop_event.is_set():
+                raise KeyboardInterrupt
+            self._fpga_active()
+            self._drain(1000)
+            self._fpga(P.CMD_PARAMETER_SETTING, settings)
+            self._sleep(0.03)  # FPGA needs time to settle the threshold voltage
+            if stop_event is not None and stop_event.is_set():
+                raise KeyboardInterrupt
+            start_time = datetime.datetime.now()
+            t0 = last_packet = time.monotonic()
+            start_sent = True
+            self._fpga(P.CMD_SIMPLE_TRIGGER, trig_bytes)
+            stream_started = True
+            self.t.stream_start(n_xfer, P.READ_TRANSFER_SIZE, 1200)
             while state == "running":
-                chunk = self.t.stream_get(0.1)
+                if self.t.no_device:
+                    state, reason = "nodevice", "disconnected"
+                    error = "device disconnected during capture"
+                    break
+                if self.t.stream_error:
+                    raise CaptureError(self.t.stream_error)
+                if stop_event is not None and stop_event.is_set():
+                    raise KeyboardInterrupt
                 now = time.monotonic()
+                if cfg.timeout_s is not None and now - t0 >= cfg.timeout_s:
+                    state, reason = "timeout", "deadline"
+                    error = "capture did not finish within %.1f s" % cfg.timeout_s
+                    if not triggered:
+                        reason = "trigger_timeout"
+                        error = "no trigger within %.1f s" % cfg.timeout_s
+                    break
+                if now - last_packet >= self.silence_timeout_s:
+                    state, reason = "timeout", "communication_timeout"
+                    error = "device stopped answering (communication timeout)"
+                    break
+                wait = min(0.1, self.silence_timeout_s - (now - last_packet))
+                if cfg.timeout_s is not None:
+                    wait = min(wait, cfg.timeout_s - (now - t0))
+                chunk = self.t.stream_get(wait)
                 if chunk is None:
-                    if self.t.no_device:
-                        state, error = "nodevice", "device disconnected during capture"
-                        break
-                    waiting_trigger = is_buffer and not instant and not triggered
-                    if cfg.timeout_s is not None and now - t0 > cfg.timeout_s:
-                        state = "timeout"
-                        error = ("no trigger within %.1f s" % cfg.timeout_s) if waiting_trigger \
-                            else ("capture did not finish within %.1f s" % cfg.timeout_s)
-                        break
-                    if now - last_packet > silence_limit:  # GUI: "应答超时"
-                        state, error = "timeout", "device stopped answering (communication timeout)"
-                        break
                     continue
                 for pkt in parser.feed(P.normalize_stream(chunk)):
-                    last_packet = now
+                    last_packet = time.monotonic()
                     o, p = pkt.order, pkt.payload
                     if o == P.ORDER_SAMPLES:
+                        if len(p) < 3 or (cfg.rle and len(p) % 2):
+                            raise CaptureError("malformed sample packet")
                         ch = p[0]
                         if ch >= n_ch:
                             raise CaptureError("data packet for invalid channel %d" % ch,
                                                "Re-plug the analyzer and try again.")
+                        if ch not in data:
+                            continue
                         d = P.rle_expand(p[2:]) if cfg.rle else bytes(p[2:])
+                        if d:
+                            mark_armed()
+                            triggered = True
                         off = offsets[ch]
                         if off > 7:  # drop whole bytes now, remaining bits at the end
                             rb = off // 8
@@ -700,8 +774,11 @@ class AtkLogic:
                                 offsets[ch] = off - len(d) * 8
                                 d = b""
                         if d:
-                            if ch in data:
-                                data[ch].append(d)
+                            # The final byte may hold padding. Stop retaining data beyond
+                            # the requested sample count plus the pending bit offset.
+                            keep = (depth + offsets[ch] + 7) // 8 - got[ch]
+                            if keep > 0:
+                                data[ch].extend(d[:keep])
                             got[ch] += len(d)
                         if progress and cfg.channels and ch == cfg.channels[0]:
                             pr = min(99, int(got[ch] * 8 * 100 / depth))
@@ -737,70 +814,102 @@ class AtkLogic:
                                     mn = min(nz) if nz else 0
                                     for i in range(n_ch):
                                         offsets[i] = (counts[i] - mn) * 8 if (counts[i] and i in cfg.channels) else 0
-                                    state = "stopped"
+                                    state, reason = "overflow", "capacity_overflow"
                                 if exceed_bandwidth:
-                                    state = "done"
+                                    state, reason = "overflow", "bandwidth_overflow"
                         triggered = True
                     elif o == P.ORDER_REPLY:
                         if len(p) >= 3:
                             code = p[2]
                             if code == P.CMD_STOP:
-                                state = "done"
-                            elif code == P.CMD_SIMPLE_TRIGGER and len(p) >= 4 and p[3] != 3:
-                                raise CaptureError("the analyzer rejected the capture parameters",
-                                                   "Choose another sample rate / depth / channel set.")
+                                state, reason = "error", "unexpected_stop"
+                                error = "device reported a stop before capture completion"
+                            elif code == P.CMD_SIMPLE_TRIGGER:
+                                if len(p) < 4:
+                                    raise CaptureError("malformed capture-start response")
+                                if p[3] != 3:
+                                    raise CaptureError("the analyzer rejected the capture parameters (status 0x%02x)" % p[3],
+                                                       "Choose another sample rate / depth / channel set.")
+                                mark_armed()
                     elif o == P.ORDER_END:
-                        state = "done"
+                        state, reason = "done", "device_end"
                         if not is_buffer and len(p) >= 3 and p[2] == 1:
                             exceed_capacity = True
+                            state, reason = "overflow", "capacity_overflow"
                     elif o == P.ORDER_PROGRESS:
                         if len(p) < 7:
                             raise CaptureError("malformed progress packet")
                         val = P.u40(p[2:7])
+                        mark_armed()
                         if is_buffer:
                             if val > trig_depth:
                                 triggered = True
                             if progress:
                                 pr = min(100, int(val * 100 / depth)) if depth else 0
                                 progress("triggered" if val > trig_depth else "pre-trigger", pr)
-                        elif progress:
-                            progress("stream", 0)
+                        else:
+                            # In Stream, progress zero reports that the device is waiting for the trigger.
+                            triggered = triggered or val != 0
+                            if progress:
+                                progress("stream" if triggered else "waiting-trigger", 0)
                     if state != "running":
                         break
         except KeyboardInterrupt:
-            state, error = "stopped", "interrupted by user"
+            state, reason = "stopped", "requested_stop"
         except CaptureError as e:
-            state, error = "error", str(e)
+            state, reason, error = "error", "capture_error", str(e)
+        except DeviceStateError as e:
+            state, reason, error = "error", "transport_error", str(e)
         finally:
             # end of DeviceRecvThread: stop reader, send Stop, flush the MCU
-            self.t.stream_stop()
-            try:
-                self._fpga(P.CMD_STOP)
-            except AtkError:
-                pass
-            self._drain(1000)
+            if stream_started:
+                self.t.stream_stop()
+            if start_sent and not self.t.no_device:
+                try:
+                    self._fpga(P.CMD_STOP)
+                    # ATK-Logic sleeps the FPGA at the end of each acquisition
+                    # unless PWM is running. The next acquisition starts with a clean wake.
+                    if not any(self._pwm_on):
+                        self.set_reset_state(0)
+                    self._drain(1000)
+                except AtkError as e:
+                    if state in ("done", "stopped"):
+                        state, reason, error = "error", "cleanup_error", str(e)
+
+        if self.t.stream_error and stream_started:
+            error = self.t.stream_error
+            host_overflow = "overflow" in error.lower()
+            state, reason = (("overflow", "transport_overflow") if host_overflow
+                             else ("error", "transport_error"))
 
         if exceed_bandwidth:
             warnings.append("data exceeded the hardware bandwidth; data is invalid")
         if exceed_capacity:
-            warnings.append("data exceeded the hardware capacity; only the last valid part is kept")
+            warnings.append("data exceeded the hardware capacity")
         if error:
             warnings.append(error)
 
         chans: Dict[int, Channel] = {}
-        avail = []
+        channel_samples = {}
+        discard = is_buffer and reason == "requested_stop"
+        if discard:
+            warnings.append("buffer capture cancelled; DL16 does not upload a stopped buffer")
         for c in cfg.channels:
-            raw = b"".join(data[c])
-            packed = np.frombuffer(raw, np.uint8) if raw else np.zeros(0, np.uint8)
+            raw = b"" if discard else data[c]
+            packed = np.frombuffer(memoryview(raw).toreadonly(), np.uint8)
+            nbits = min(max(0, len(packed) * 8 - offsets[c]), depth)
             packed = shift_packed(packed, offsets[c])  # remaining start offset (bits)
-            nbits = len(packed) * 8
-            avail.append(nbits)
-            chans[c] = Channel(c, packed, min(nbits, depth))
-        n = min([depth] + avail) if avail else 0
+            channel_samples[c] = nbits
+            chans[c] = Channel(c, packed, nbits)
+        n = min(channel_samples.values())
         if n == 0 and state in ("error", "timeout", "nodevice") and error:
             raise CaptureError(error, "Check wiring/trigger settings; re-plug the analyzer if it persists.")
-        if n < depth and state == "done" and not exceed_capacity:
+        if state == "done" and n < depth:
+            state, reason = "short", "short_capture"
             warnings.append("received %d of %d samples" % (n, depth))
+        if state == "done" and is_buffer and not offset_seen:
+            state, reason = "error", "missing_buffer_offset"
+            warnings.append("buffer capture ended without channel alignment information")
         trig_sample = trig_depth if is_buffer else (trigger_pos or None)
         if trig_sample is not None and trig_sample >= n:
             trig_sample = None
@@ -812,6 +921,13 @@ class AtkLogic:
             "triggers": {str(k): v for k, v in cfg.triggers.items()},
             "trigger_position_percent": cfg.trigger_position if is_buffer else None,
             "state": state,
+            "end_reason": reason,
+            "armed": armed,
+            "immediate": instant,
+            "complete": state == "done" and armed,
+            "partial_exportable": state == "stopped" and not is_buffer and n > 0,
+            "overflow": exceed_bandwidth or exceed_capacity or host_overflow,
+            "channel_samples": channel_samples,
             "warnings": warnings,
             "elapsed_s": round(time.monotonic() - t0, 3),
         }

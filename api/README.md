@@ -1,19 +1,19 @@
 # atk-logic：ATK-Logic 逻辑分析仪跨平台 Python API / 命令行工具
 
 适用于正点原子（ALIENTEK）DL16 / DL16 Plus 逻辑分析仪（USB `1a86:ffcc`）。
-同一套代码在 **Windows 与 Linux** 上行为一致，底层通过 libusb（python-libusb1）直接与设备通信，不依赖官方上位机，也不依赖 libsigrokdecode。
+底层通过 libusb（python-libusb1）直接与设备通信。Windows 上可从 PowerShell 后台运行，采集过程没有 GUI。
 
 功能：
 
 - 设备枚举、连接握手、读取设备信息（型号、USB 2.0/3.0、MCU/FPGA/硬件版本、是否 Plus）
-- 采集：Buffer（硬件缓存，支持触发）/ Stream（USB 实时流）两种模式，可选硬件 RLE 压缩
+- 采集：Buffer（硬件缓存）/ Stream（USB 实时流），支持正常、立即、循环和简单触发。Buffer 支持硬件 RLE
 - PWM 输出（2 路，1 Hz–20 MHz，占空比 1–99 %）
-- 读取官方上位机保存的工程文件 `.atkdl`
+- 读取和写出官方上位机工程文件 `.atkdl`
 - 导出 CSV（与上位机格式一致的“变化点”行）、VCD（PulseView / sigrok-cli / GTKWave 可读）、无损边沿 JSON（`.atkjson`）、统计摘要 JSON
 - 协议解码：用纯 Python 实现的 `sigrokdecode` 兼容层直接运行仓库 `runtime/decoders/` 下的 180 余个 sigrok 解码器（UART、I²C、SPI、CAN、SWD、Modbus、USB PD、WS2812……），支持堆叠（如 I²C → 24xx EEPROM）
-- 所有命令输出 JSON，便于脚本或 Claude Code 等 AI 工具调用
+- 采集输出 JSON，便于 PowerShell 或其他程序调用
 
-> **重要说明**：协议实现逐行对照了官方 C++ 源码（见文末“实现对照”），并用软件模拟的设备做了端到端测试，`.atkdl` 读取与解码已用仓库自带的 12 个真实采集文件验证；**但开发环境中没有真实硬件，USB 实机采集尚未在真机上验证**。首次使用请先用 `info`、PWM 自环等简单操作确认。
+Windows WinUSB 实测通过的设备为 DL16（硬件 2、MCU 1.9、FPGA 2.22、设备要求上位机至少 1.1.0.8）。原版 ATK-Logic 1.1.2.0 可打开 CLI 导出的 `.atkdl`。
 
 ## 1. 安装
 
@@ -30,6 +30,15 @@ pip install .            # 或开发模式：pip install -e .
 - python-libusb1 的 Windows wheel 已内置 `libusb-1.0.dll`，无需另装 libusb。
 - 设备需要 WinUSB 驱动。安装过官方 ATK-Logic 上位机的电脑一般已具备；否则可用 [Zadig](https://zadig.akeo.ie/) 为 `VID 1A86 / PID FFCC` 绑定 WinUSB。
 
+在仓库的 `api` 目录安装到独立环境。使用 `atk-logic-cli` 可以避免与官方 `ATK-Logic.exe` 重名。
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e '.[test]'
+$atk = (Resolve-Path .\.venv\Scripts\atk-logic-cli.exe).Path
+& $atk limits -c 0-2
+```
+
 ### Linux
 
 ```bash
@@ -45,10 +54,24 @@ sudo udevadm control --reload && sudo udevadm trigger
 解码器使用仓库中的 `runtime/decoders/`。以开发模式（`pip install -e .`）或直接在仓库内运行时会自动找到；
 若把包安装到别处，请设置环境变量 `ATK_DECODERS_DIR=<仓库>/runtime/decoders`，或在命令中加 `--decoders-dir`。
 
-## 2. 命令行（`atk-logic`，也可用 `python -m atk_logic`）
+## 2. 命令行
 
-所有命令向 stdout 输出一个 JSON；加 `--pretty` 缩进。出错时输出 `{"error":..., "type":..., "hint":...}` 并返回非 0：
-2 = 参数错误，3 = 未找到设备，4 = 权限/驱动/被占用，5 = 设备状态异常（如需升级固件），6 = 采集失败。
+`atk-logic`、`atk-logic-cli` 和 `python -m atk_logic` 调用同一个入口。单次采集向 stdout 输出一个 JSON，循环每轮输出一行 JSON。退出码 `0` 表示成功，`1` 表示文件或其他运行错误，`2` 参数错误，`3` 找不到设备，`4` 无法访问设备（包括被占用），`5` 设备状态异常，`6` 采集失败，`130` 取消。
+
+### JR 三路预设
+
+用 `presets/jr-three-channel.json` 进行 D0（DSC PPM）、D1（JR TX）、D2（JR PPM/SBUS）同步采集。参数为 10 MHz、10 秒、1.6 V、Buffer、立即采集。仪器空闲时，从 `api` 目录执行：
+
+```powershell
+& $atk capture --preset .\presets\jr-three-channel.json --events -o .\jr.atkdl
+& $atk capture --preset .\presets\jr-three-channel.json --rate 100M --rle --timeout 120s -o .\jr-rle.atkdl
+& $atk capture --preset .\presets\jr-three-channel.json --acquisition repeat --repeat-count 3 --interval 2s -o .\jr-series.atkdl
+```
+
+- 命令行覆盖预设；`--duration` 和 `--samples` 任选其一，`--no-rle` 和 `--no-trigger` 清除对应预设。`--acquisition immediate` 忽略触发条件。循环按正常模式采集，每轮结束后至少等待指定间隔，按 `jr-series.0001.atkdl` 等名称独立保存。循环发现同名结果会报错。
+- `--events` 在仪器确认启动或已回传有效进度/数据时向 stderr 输出 `{"event":"armed","cycle":1}`。正常触发采集收到 `armed` 后仍可等待外部触发。板端脚本可以用这个事件安排动作。最终 JSON 中使用 `capture.meta.complete`、`capture.meta.channel_samples`、`capture.meta.end_reason` 和 `capture.meta.overflow` 判定结果。
+- `--stop-file PATH` 监视一个启动时不存在的文件。创建该文件或发送 Ctrl+C 可取消。`--stop-mode save-received` 仅用于 Stream，保存有完整公共时基的已接收部分，结果标记 `complete: false`。普通欠采、超时、断连和溢出均返回失败，采集失败时已有输出文件保留。`.atkdl`、CSV 和 VCD 可重复指定 `-o`，每个文件写完后通过同目录临时文件替换目标。采集默认仅计算轻量摘要，`--stats` 加算边沿统计。
+- 100 MHz 三路 10 秒相当于每路 10 亿点，打包波形约 375 MB，另外还需要收包和保存的内存。RLE 的实际采满能力受信号活动和硬件容量影响。以每路真实点数和溢出状态验收。
 
 ```bash
 atk-logic list                                    # 枚举设备（不打开）
@@ -61,8 +84,8 @@ atk-logic capture -c 0-3 -r 10M -d 10ms --threshold 3.3V -o cap.vcd -o cap.csv
 # ch0 上升沿触发，触发前保留 10 %，最多等 5 s
 atk-logic capture -c 0,1 -r 100M -n 1M -t 0=rising --trigger-pos 10 --timeout 5s -o trig.atkjson
 
-# Stream 模式 + RLE，长时间采集（stream 模式下 采样率 × 通道数 ≤ 320 MHz，且 ≤ 100 MHz）
-atk-logic capture -c 0,1 -r 20M -d 2s --mode stream --rle -o long.atkjson
+# Stream 模式长时间采集（采样率 × 通道数 ≤ 320 MHz，且采样率 ≤ 100 MHz）
+atk-logic capture -c 0,1 -r 20M -d 2s --mode stream -o long.atkdl
 
 # 采集并直接解码（UART RX 接 ch0，115200 8N1）
 atk-logic capture -c 0 -r 10M -d 50ms -D uart -m rx=0 -O baudrate=115200 --ann rx-data
@@ -70,10 +93,9 @@ atk-logic capture -c 0 -r 10M -d 50ms -D uart -m rx=0 -O baudrate=115200 --ann r
 # 自环测试：PWM0 输出 1 MHz 50 % 接到 ch0，同时采集
 atk-logic capture -c 0 -r 100M -d 1ms --pwm 0:1M:50 --edges
 
-# PWM：启动后退出（输出保持）/ 保持 10 s 后关闭 / 关闭
-atk-logic pwm 0 -f 1k --duty 25
+# PWM：在同一调用内保持 10 s 后关闭
 atk-logic pwm 1 -f 2.5M --duty 50 --hold 10s
-atk-logic pwm-stop            # 或 pwm-stop 0 / pwm-stop 1
+atk-logic pwm-stop            # 打开会话并关闭两路输出
 
 # 离线：打开上位机保存的 .atkdl，输出统计并导出
 atk-logic open ../runtime/test/uart_tx_115200.atkdl -o uart.vcd --pretty
@@ -95,8 +117,8 @@ atk-logic decoders spi --pretty    # 查看某解码器的通道、选项、注�
 | `-r 10M` | 采样率，可选 1/2/4/5/10/20/25/40/50/100/200/250/500 MHz、1 GHz（受模式/型号/通道数限制，见 `limits`） |
 | `-d 10ms` / `-n 1M` | 采集时长 / 每通道采样点数 |
 | `--threshold` | 阈值电压（-5…5 V）或预设 `5V`/`3.3V`/`3.0V`/`2.5V`/`1.8V`/`1.5V`/`1.2V`（对应上位机 CMOS 预设 2.5/1.6/1.5/1.2/0.9/0.7/0.6 V），默认 1.6 V |
-| `-t 0=rising,3=high` | 触发：`rising` `falling` `high` `low` `edge`（双沿）；不给则立即采集；仅 buffer 模式 |
-| `--trigger-pos 10` | 触发前数据占比（1–90 %） |
+| `-t 0=rising,3=high` | 简单触发支持 `rising`、`falling`、`high`、`low` 和 `edge`（双沿），多路条件同时满足时触发 |
+| `--trigger-pos 10` | Buffer 触发前数据占比（1–90 %）。Stream 的触发位置由仪器报告 |
 | `-D` / `-m` / `-O` | 解码器（可堆叠，低层在前）/ 通道映射 / 选项（有歧义时写 `decoder.option=value`） |
 | `--ann` / `--rows` | 只输出指定注释类别 / 注释行 |
 
@@ -116,11 +138,16 @@ with AtkLogic.open() as la:                    # 连接握手与官方上位机�
                      trigger={0: "rising"}, trigger_position=10, timeout=5)
 # 退出 with 时按上位机流程关闭（唤醒 FPGA → 关 PWM → Exit → 休眠）
 
+if not cap.meta["complete"]:
+    raise RuntimeError(cap.meta["end_reason"])
+
 print(cap.summary())                           # 每通道跳变数、占空比、频率、首末边沿……
 print(cap.edges_text(max_edges=50))            # 适合直接阅读的电平持续时间文本
 bits = cap.channel(0).bits(0, 1000)            # numpy 0/1 数组
 edges = cap.channel(0).edges                   # 跳变位置（采样点序号）
-cap.save("cap.vcd"); cap.save("cap.csv"); cap.save("cap.atkjson")
+cap.save("cap.atkdl")
+cap.save("cap.csv")
+cap.save("cap.vcd")
 
 res = decode(cap, [{"id": "uart", "channels": {"rx": 1}, "options": {"baudrate": 115200}}])
 print(res["rows"])                             # 按注释行汇总的文本
@@ -145,20 +172,18 @@ print(decode(old, old.meta["decoders"][0])["rows"]["spiflash.commands"])
 | `protocol.encode_settings/encode_trigger/encode_pwm` | `pv/controller/session_controller.cpp` | 参数、触发、PWM 字节编码 |
 | `AtkLogic.connect` | `pv/thread/connect.cpp` | 握手、版本检查、bootloader 检测 |
 | `AtkLogic.capture` | `pv/data/session.cpp` `OrderStart`、`pv/thread/thread_work.cpp` `DeviceRecvThread` | 采集流程、order 1–6 数据包处理、RLE 展开、buffer 模式起始偏移裁剪、超容/超带宽标志 |
-| `atkdl.read_atkdl` | `ThreadWork::LoadSourceFileThreadPara` | zip 内 `channel.ini` + 每通道 1 MiB 数据块 + `tog/value` 常量块 |
+| `atkdl.read_atkdl` / `write_atkdl` | `ThreadWork::LoadSourceFileThreadPara` / `SaveSourceFileThreadPara` | zip 内 `channel.ini` + 每通道 1 MiB 数据块 + `tog/value` 常量块 |
 | `decode.py` | libsigrokdecode `type_decoder.c` / `instance.c` | `wait()` 条件语义（h/l/r/f/e/n/skip、OR/AND、`matched`、`samplenum`） |
 
 解码器引擎不逐点扫描，而是在各通道的跳变列表上跳转，因此长时间空闲的数据几乎不耗时；对跳变极多的数据（例如 5 亿点、1500 万次跳变的 SWD 文件）纯 Python 解码需要数分钟，可用 `--start/--end` 截取窗口或用 `--limit` 限制注释数量提前结束。
 
-## 5. 局限与注意事项
+## 5. 实机验收与限制
 
-- **未在真实硬件上验证**（见开头说明）。协议细节与官方源码一致，但以下几点只能在真机上确认：
-  - buffer 模式等待触发期间设备是否持续发送进度包（官方上位机约 2 s 无数据即判定“应答超时”，本包沿用该逻辑，可通过 `AtkLogic.silence_timeout_s` 调整）；
-  - `pwm` 命令默认在释放 USB 后保持 PWM 输出（跳过关闭流程），设备在主机端断开后是否仍保持输出未经验证；如需确定行为请用 `--hold` 或在同一 Python 会话中完成 PWM + 采集；
-  - Stream 模式在高带宽下纯 Python 是否来得及接收（已使用多路异步 libusb 传输；若出现“超出硬件容量”警告，请降低采样率或通道数，或改用 buffer 模式）。
-- **官方上位机与本 API 不能同时占用设备**，使用前请关闭上位机。
-- 不实现固件升级 / bootloader 相关命令；检测到 bootloader 状态或固件版本过低时会报错并提示用官方上位机升级。
-- 仅实现官方上位机实际使用的“简单触发”；上位机中尚未完成的多级触发同样未实现。
+- 实测 D0–D2、1.6 V、Buffer、10 MHz × 10 秒和 100 MHz × 10 秒（RLE），三路均采满。RLE 用例 Windows 进程峰值工作集约 489 MiB。两份 `.atkdl` 均已在原版上位机打开。另通过了 Buffer 和 Stream 上升沿触发、三轮循环、Buffer 取消与 Stream 停止后保存共同样本。
+- 官方上位机和 CLI 分时使用同一台仪器。实测上位机占用时 CLI 返回退出码 `4`。`list` 只枚举，`info` 和 `capture` 会打开设备并初始化。握手和默认退出会关闭两路 PWM。使用 `capture --pwm` 可在同一个会话内操作，实际输出和跨进程保持尚未实机验证。
+- 高持续带宽的 Stream、长时间等待触发、DL16 Plus 和其他新版设备固件尚未完成本机验证。收到容量或带宽溢出时，CLI 返回采集失败。
+- 按厂商手册 §5.2、§5.3.4、§5.4 和 §5.12，DL16 的 RLE 只用于 Buffer。原生滚动、停止后上传 Buffer 和高级触发是 DL32 功能。
+- 检测到 bootloader 或不兼容的仪器版本时报错退出。固件升级使用官方工具。
 - 采集数据保存在内存中（每通道每 8 个采样点 1 字节），超大深度时请注意内存。
 
 ## 6. 测试

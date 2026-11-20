@@ -19,6 +19,7 @@ test = ["pytest>=7"]
 
 [project.scripts]
 atk-logic = "atk_logic.cli:main"
+atk-logic-cli = "atk_logic.cli:main"
 
 [tool.setuptools]
 packages = ["atk_logic"]

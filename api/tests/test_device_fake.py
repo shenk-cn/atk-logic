@@ -47,6 +47,25 @@ def test_bootloader_refused():
     assert "official ATK-Logic GUI" in e.value.hint
 
 
+def test_verified_dl16_later_firmware_handshake():
+    fake = FakeDevice({}, level=0, usb_version=2, mcu_version=19, fpga_version=222,
+                      min_app_version=1108)
+    analyzer = make(fake)
+    assert analyzer.info.as_dict()["min_app_version"] == 1108
+    cap = analyzer.capture(channels=[0, 1, 2], samplerate=10e6, samples=1000, immediate=True)
+    assert cap.meta["complete"]
+    assert len(fake.trigger_bytes) == 10 and fake.trigger_bytes[-2:] == b"\x01\x00"
+
+
+@pytest.mark.parametrize("field,value", [("level", 1), ("mcu_version", 20),
+                                          ("fpga_version", 223), ("min_app_version", 1109)])
+def test_other_later_firmware_still_rejected(field, value):
+    signature = dict(level=0, usb_version=2, mcu_version=19, fpga_version=222, min_app_version=1108)
+    signature[field] = value
+    with pytest.raises(DeviceStateError, match="unverified DL16 firmware"):
+        make(FakeDevice({}, **signature))
+
+
 @pytest.mark.parametrize("rle", [False, True])
 def test_buffer_capture_offset_trim(rle):
     sig = {0: noise(1), 3: square(40, 0.25), 15: square(1000, 0.5, 13)}
@@ -125,7 +144,6 @@ def test_rejected_parameters():
     (dict(channels=[16], samplerate=1e6, samples=10_000), "0..15"),
     (dict(channels=[0], samplerate=1e6, samples=10), "at least 1000"),
     (dict(channels=[0], samplerate=1e6, samples=10_000, trigger={1: "rising"}), "not an enabled"),
-    (dict(channels=[0], samplerate=1e6, samples=10_000, mode="stream", trigger={0: "rising"}), "buffer mode"),
     (dict(channels=list(range(16)), samplerate=250e6, samples=100_000_000), "buffer too small"),
     (dict(channels=[0], samplerate=1e6, samples=10_000, threshold=7), "threshold"),
 ])

@@ -45,7 +45,8 @@ class FakeDevice(Transport):
     def __init__(self, signals: Dict[int, Callable[[int], np.ndarray]], level: int = 1,
                  name: str = "DL16", junk_bits: int = 37, packet_bytes: int = 3000,
                  rle_flags: int = 0, never_trigger: bool = False, bootloader: bool = False,
-                 stream_overflow: bool = False, reject_params: bool = False):
+                 stream_overflow: bool = False, reject_params: bool = False, usb_version: int = 3,
+                 mcu_version: int = 15, fpga_version: int = 120, min_app_version: int = 100):
         self.signals = signals
         self.level = level
         self.name = name
@@ -56,6 +57,10 @@ class FakeDevice(Transport):
         self.bootloader = bootloader
         self.stream_overflow = stream_overflow
         self.reject_params = reject_params
+        self.usb_version = usb_version
+        self.mcu_version = mcu_version
+        self.fpga_version = fpga_version
+        self.min_app_version = min_app_version
         self.sync_q: deque = deque()
         self.chunks: deque = deque()
         self.log: List[tuple] = []
@@ -74,14 +79,16 @@ class FakeDevice(Transport):
             if cmd == P.MCU_GET_VERSION:
                 r = bytearray(512)
                 r[0:4] = b"\x0a\x81\x01" + (b"\x62" if self.bootloader else b"\x61")
-                r[4], r[5], r[6], r[8] = 1, 5, 2, self.level  # mcu 15, hw 2
+                r[4], r[5] = divmod(self.mcu_version, 10)
+                r[6], r[8] = 2, self.level
                 self.sync_q.append(bytes(r))
             return
         assert len(data) % P.BLOCK == 0, "FPGA frames must be 2048-byte multiples"
         code, payload = P.unframe_fpga_command(data)
         self.log.append(("fpga", code, payload))
         if code == P.CMD_GET_DEVICE_DATA:
-            pl = bytes([0, 0, 1, 3, 0, 1, 20, 1, 0]) + self.name.encode() + b"\x00"
+            pl = (bytes([0, 0, 1, self.usb_version, 0, *divmod(self.fpga_version, 100),
+                         *divmod(self.min_app_version, 100)]) + self.name.encode() + b"\x00")
             self.sync_q.extend(to_wire(packet(P.ORDER_DEVICE_INFO, pl), P.BLOCK))
         elif code == P.CMD_PARAMETER_SETTING:
             self.settings = {

@@ -1,4 +1,4 @@
-"""Capture data model and exports (CSV / VCD / JSON / edge text).
+"""Capture data model and exports (ATKDL / CSV / VCD / JSON / edge text).
 
 Samples are kept bit-packed (LSB first, 8 samples per byte, exactly like the
 device and the GUI's Segment class). Transitions are computed lazily and are
@@ -189,7 +189,12 @@ class Capture:
         return Capture(self.samplerate, chans, end - start, trig, meta, self.start_time)
 
     # -- summaries ---------------------------------------------------------
-    def summary(self) -> dict:
+    def summary(self, include_stats: bool = True) -> dict:
+        channels = ([ch.stats(self.samplerate) for ch in self.channels.values()]
+                    if include_stats else [
+                        {"channel": ch.index, "name": ch.name, "samples": ch.n}
+                        for ch in self.channels.values()
+                    ])
         return {
             "samplerate_hz": self.samplerate,
             "samples": self.n_samples,
@@ -197,7 +202,7 @@ class Capture:
             "trigger_sample": self.trigger_sample,
             "trigger_time_s": (self.trigger_sample / self.samplerate
                                if self.trigger_sample is not None and self.samplerate else None),
-            "channels": [ch.stats(self.samplerate) for ch in self.channels.values()],
+            "channels": channels,
             "meta": self.meta,
         }
 
@@ -375,10 +380,18 @@ class Capture:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.summary(), f, indent=1, ensure_ascii=False)
 
+    def to_atkdl(self, path: str) -> None:
+        """Save packed samples in an ATK-Logic project archive."""
+        from .atkdl import write_atkdl
+
+        write_atkdl(self, path)
+
     def save(self, path: str) -> str:
-        """Export by file extension: .vcd .csv .atkjson .json (summary)."""
+        """Export by file extension: .atkdl .vcd .csv .atkjson .json (summary)."""
         low = path.lower()
-        if low.endswith(".vcd"):
+        if low.endswith(".atkdl"):
+            self.to_atkdl(path)
+        elif low.endswith(".vcd"):
             self.to_vcd(path)
         elif low.endswith(".csv"):
             self.to_csv(path)
@@ -387,7 +400,7 @@ class Capture:
         elif low.endswith(".json"):
             self.to_json_summary(path)
         else:
-            raise ValueError("unknown export format for %r (use .vcd/.csv/.atkjson/.json)" % path)
+            raise ValueError("unknown export format for %r (use .atkdl/.vcd/.csv/.atkjson/.json)" % path)
         return path
 
 

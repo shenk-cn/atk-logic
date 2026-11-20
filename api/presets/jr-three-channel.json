@@ -1,0 +1,11 @@
+{
+  "channels": "0,1,2",
+  "rate": "10M",
+  "duration": "10s",
+  "threshold": 1.6,
+  "mode": "buffer",
+  "rle": false,
+  "trigger_pos": 1,
+  "acquisition": "immediate",
+  "timeout": "60s"
+}

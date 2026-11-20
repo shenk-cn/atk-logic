@@ -9,8 +9,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import re
 import sys
+import tempfile
+import time
 from typing import Dict, List, Optional
 
 from . import __version__
@@ -115,11 +118,21 @@ def _window(cap, args):
 
 
 def _exports(cap, outs: Optional[List[str]]) -> List[str]:
-    done = []
-    for o in outs or []:
-        cap.save(o)
-        done.append(os.path.abspath(o))
-    return done
+    files = []
+    try:
+        for output in outs or []:
+            target = Path(output).absolute()
+            with tempfile.NamedTemporaryFile(dir=target.parent, suffix=target.suffix,
+                                             prefix=".atk-", delete=False) as tmp:
+                staged = Path(tmp.name)
+            files.append((staged, target))
+            cap.save(str(staged))
+        for staged, target in files:
+            staged.replace(target)
+        return [str(target) for _, target in files]
+    finally:
+        for staged, _ in files:
+            staged.unlink(missing_ok=True)
 
 
 def _stack_from_args(args, cap) -> List[dict]:
@@ -214,31 +227,117 @@ def cmd_info(args):
         _emit({"device": la.info.as_dict(), "api_version": __version__}, args)
 
 
+_CAPTURE_DEFAULTS = {
+    "channels": None, "rate": None, "duration": None, "samples": None,
+    "threshold": None, "mode": "buffer", "rle": False, "trigger": None,
+    "trigger_pos": 1.0, "timeout": None, "acquisition": None,
+    "repeat_count": None, "interval": None, "stop_mode": "abort",
+}
+
+
+def _apply_capture_preset(args):
+    preset = {}
+    if args.preset:
+        preset = json.loads(Path(args.preset).read_text(encoding="utf-8-sig"))
+        if not isinstance(preset, dict):
+            raise ValueError("the preset must be a JSON object")
+        unknown = preset.keys() - _CAPTURE_DEFAULTS.keys()
+        if unknown:
+            raise ValueError("unknown preset fields: " + ", ".join(sorted(unknown)))
+    if args.duration is not None:
+        preset.pop("samples", None)
+    if args.samples is not None:
+        preset.pop("duration", None)
+    for key, default in _CAPTURE_DEFAULTS.items():
+        if getattr(args, key) is None:
+            setattr(args, key, preset.get(key, default))
+
+
 def _capture_kwargs(args):
-    if not args.channels or not args.rate:
+    if args.channels is None or args.rate is None:
         raise ValueError("capture needs -c/--channels and -r/--rate")
-    if not args.duration and not args.samples:
-        raise ValueError("give --duration (e.g. 10ms) or --samples (e.g. 1M)")
-    # cheap checks before the device is opened
-    P.rate_index(parse_freq(args.rate))
-    for v in parse_triggers(args.trigger).values():
-        P.normalize_trigger(v)
+    if (args.duration is None) == (args.samples is None):
+        raise ValueError("give exactly one of --duration and --samples")
+    channels = parse_channels(args.channels)
+    if not channels or any(not 0 <= ch < P.CHANNEL_COUNT for ch in channels):
+        raise ValueError("select at least one channel from 0..15")
+    rate = parse_freq(args.rate)
+    P.rate_index(rate)
+    if args.mode not in ("buffer", "stream") or not isinstance(args.rle, bool):
+        raise ValueError("mode must be buffer or stream, and rle must be true or false")
+    if rate not in P.allowed_rates(args.mode, len(set(channels)), plus=True):
+        raise ValueError("requested sample rate is unavailable with %d channels in %s mode" %
+                         (len(set(channels)), args.mode))
+    if args.mode == "stream" and args.rle:
+        raise ValueError("DL16 hardware RLE requires Buffer mode")
+    if args.acquisition == "rolling" or args.stop_mode == "upload":
+        raise ValueError("native rolling and Buffer stop-and-upload are DL32 features; DL16/Plus do not support them")
+    if args.acquisition not in (None, "normal", "immediate", "repeat"):
+        raise ValueError("acquisition must be normal, immediate or repeat")
+    if args.stop_mode not in ("abort", "save-received"):
+        raise ValueError("stop_mode must be abort or save-received")
+    if args.stop_mode == "save-received" and args.mode != "stream":
+        raise ValueError("--stop-mode save-received requires Stream mode")
+    if args.acquisition != "repeat" and (args.interval is not None or args.repeat_count is not None):
+        raise ValueError("--interval and --repeat-count require repeat acquisition")
+    if args.repeat_count is not None and (type(args.repeat_count) is not int or args.repeat_count < 1):
+        raise ValueError("repeat_count must be a positive integer")
+    if args.trigger is not None and (not isinstance(args.trigger, list) or
+                                     any(not isinstance(trigger, str) for trigger in args.trigger)):
+        raise ValueError('trigger must be a list of strings, e.g. ["1=rising"]')
+    triggers = {} if args.acquisition == "immediate" else parse_triggers(args.trigger)
+    for ch, trigger in triggers.items():
+        if ch not in channels:
+            raise ValueError("trigger channel %d is not an enabled channel" % ch)
+        P.normalize_trigger(trigger)
+    duration = parse_time(args.duration) if args.duration is not None else None
+    samples = parse_count(args.samples) if args.samples is not None else None
+    timeout = parse_time(args.timeout) if args.timeout is not None else None
+    trigger_position = float(args.trigger_pos)
+    if not 1 <= trigger_position <= 90:
+        raise ValueError("trigger_pos must be 1..90 percent")
+    if args.mode == "stream" and trigger_position != 1:
+        raise ValueError("--trigger-pos is adjustable in Buffer mode only")
+    if (samples is not None and samples < 1000) or (duration is not None and duration * rate < 1000):
+        raise ValueError("capture at least 1000 samples per channel")
+    if timeout is not None and timeout <= 0:
+        raise ValueError("timeout must be positive")
+    for path in args.out or []:
+        target = Path(path)
+        if target.suffix.lower() not in (".atkdl", ".csv", ".vcd", ".atkjson", ".json"):
+            raise ValueError("unsupported output extension: %s" % target)
+        if not target.parent.is_dir():
+            raise ValueError("output directory does not exist: %s" % target.parent)
+    from .device import parse_threshold
+    P.encode_threshold(parse_threshold(args.threshold))
     return dict(
-        channels=parse_channels(args.channels),
-        samplerate=parse_freq(args.rate),
-        samples=parse_count(args.samples) if args.samples else None,
-        duration=parse_time(args.duration) if args.duration else None,
+        channels=channels, samplerate=rate, samples=samples, duration=duration,
         threshold=args.threshold,
-        mode=args.mode,
-        rle=args.rle,
-        trigger=parse_triggers(args.trigger),
-        trigger_position=args.trigger_pos,
-        timeout=parse_time(args.timeout) if args.timeout else None,
+        mode=args.mode, rle=args.rle, trigger=triggers, trigger_position=trigger_position,
+        timeout=timeout,
+        immediate={"immediate": True, "normal": False, "repeat": False}.get(args.acquisition),
     )
 
 
-def _do_capture(args, la):
-    kw = _capture_kwargs(args)
+class _StopFile:
+    def __init__(self, path):
+        self.path = Path(path) if path else None
+        if self.is_set():
+            raise ValueError("stop file already exists: %s" % self.path)
+
+    def is_set(self):
+        return self.path is not None and self.path.exists()
+
+    def wait(self, seconds):
+        until = time.monotonic() + seconds
+        while not self.is_set():
+            left = until - time.monotonic()
+            if left <= 0:
+                return
+            time.sleep(min(left, 0.1))
+
+
+def _capture_pwm(args, la):
     pwm_res = []
     for spec in args.pwm or []:
         parts = spec.split(":")
@@ -246,22 +345,40 @@ def _do_capture(args, la):
             raise ValueError("--pwm must look like INDEX:FREQ[:DUTY], e.g. 0:1M:50")
         pwm_res.append(la.pwm(int(parts[0]), parse_freq(parts[1]),
                               float(parts[2]) if len(parts) == 3 else 50))
-    prog = None
-    if args.verbose:
-        def prog(stage, pct):
-            sys.stderr.write("\r%-12s %3d%%" % (stage, pct))
-            sys.stderr.flush()
-    cap = la.capture(progress=prog, **kw)
-    if args.verbose:
-        sys.stderr.write("\n")
-    return cap, pwm_res
+    return pwm_res
 
 
-def cmd_capture(args):
-    _capture_kwargs(args)
-    with _open(args) as la:
-        cap, pwm_res = _do_capture(args, la)
-    out = {"capture": cap.summary(), "saved": _exports(cap, args.out)}
+def _capture_once(args, la, kw, stop_file, cycle):
+    def progress(stage, percent):
+        if args.events and stage == "armed":
+            print(json.dumps({"event": "armed", "cycle": cycle}), file=sys.stderr, flush=True)
+        elif args.verbose and not args.events:
+            print("%s %d%%" % (stage, percent), file=sys.stderr, flush=True)
+
+    return la.capture(progress=progress, stop_event=stop_file, **kw)
+
+
+def _check_capture(cap, args):
+    from .device import CaptureError
+    if cap.meta["complete"]:
+        return
+    if cap.meta["end_reason"] == "requested_stop":
+        if args.stop_mode == "abort":
+            raise KeyboardInterrupt
+        if cap.meta["partial_exportable"]:
+            return
+    error = CaptureError("capture ended before valid data could be published: %s" % cap.meta["end_reason"])
+    error.capture = cap.summary(include_stats=False)
+    raise error
+
+
+def _capture_result(cap, args, outputs, pwm_res):
+    _check_capture(cap, args)
+    out = {
+        "capture": cap.summary(include_stats=args.stats),
+        "collected_at": cap.start_time.isoformat(timespec="milliseconds"),
+        "saved": _exports(cap, outputs),
+    }
     if pwm_res:
         out["pwm"] = pwm_res
     if args.edges:
@@ -270,7 +387,43 @@ def cmd_capture(args):
         from .decode import decode
         res = decode(cap, _stack_from_args(args, cap), args.decoders_dir, max_annotations=args.limit)
         out["decode"] = _decode_output(res, args)
-    _emit(out, args)
+    return out
+
+
+def cmd_capture(args):
+    _apply_capture_preset(args)
+    kw = _capture_kwargs(args)
+    stop_file = _StopFile(args.stop_file)
+    if args.acquisition != "repeat":
+        with _open(args) as la:
+            pwm_res = _capture_pwm(args, la)
+            cap = _capture_once(args, la, kw, stop_file, cycle=1)
+        _emit(_capture_result(cap, args, args.out, pwm_res), args)
+        return
+
+    interval = parse_time(args.interval) if args.interval is not None else 0
+    if args.pretty:
+        raise ValueError("repeat acquisition emits one compact JSON line per cycle")
+    with _open(args) as la:
+        pwm_res = _capture_pwm(args, la)
+        cycle = 1
+        while not stop_file.is_set():
+            outputs = [str(p.with_name("%s.%04d%s" % (p.stem, cycle, p.suffix)))
+                       for p in map(Path, args.out or [])]
+            for output in outputs:
+                if Path(output).exists():
+                    raise FileExistsError("repeat output already exists: %s" % output)
+            cap = _capture_once(args, la, kw, stop_file, cycle)
+            next_start = time.monotonic() + interval
+            out = _capture_result(cap, args, outputs, pwm_res)
+            out["cycle"] = cycle
+            _emit(out, args)
+            sys.stdout.flush()
+            if cycle == args.repeat_count or cap.meta["end_reason"] == "requested_stop":
+                break
+            cycle += 1
+            del cap, out
+            stop_file.wait(next_start - time.monotonic())
 
 
 def cmd_open(args):
@@ -296,9 +449,15 @@ def cmd_decode(args):
     else:
         if not args.capture:
             raise ValueError("give an input FILE or --capture with capture options")
-        _capture_kwargs(args)
+        _apply_capture_preset(args)
+        kw = _capture_kwargs(args)
+        if args.acquisition == "repeat":
+            raise ValueError("use capture to run repeat acquisition")
+        stop_file = _StopFile(args.stop_file)
         with _open(args) as la:
-            cap, _ = _do_capture(args, la)
+            _capture_pwm(args, la)
+            cap = _capture_once(args, la, kw, stop_file, cycle=1)
+        _check_capture(cap, args)
         if args.out:
             _exports(cap, args.out)
     res = decode(cap, _stack_from_args(args, cap), args.decoders_dir, max_annotations=args.limit)
@@ -338,19 +497,34 @@ def cmd_limits(args):
 
 
 # ------------------------------------------------------------------ parser
-def _add_capture_opts(p, required=True):
-    p.add_argument("-c", "--channels", required=required, help="channels, e.g. 0,1,2 or 0-3")
-    p.add_argument("-r", "--rate", required=required, help="sample rate, e.g. 10M, 100M, 1G")
-    p.add_argument("-d", "--duration", help="capture length as time, e.g. 10ms, 1s")
-    p.add_argument("-n", "--samples", help="capture length in samples per channel, e.g. 1M")
+def _add_capture_opts(p):
+    p.add_argument("--preset", help="JSON capture preset; explicit flags override it")
+    p.add_argument("-c", "--channels", help="channels, e.g. 0,1,2 or 0-3")
+    p.add_argument("-r", "--rate", help="sample rate, e.g. 10M, 100M, 1G")
+    length = p.add_mutually_exclusive_group()
+    length.add_argument("-d", "--duration", help="capture length as time, e.g. 10ms, 1s")
+    length.add_argument("-n", "--samples", help="capture length in samples per channel, e.g. 1M")
     p.add_argument("--threshold", default=None,
                    help="switching threshold in V (-5..5) or preset 3.3V/1.8V/5V... (default 1.6 V = 3.3V CMOS)")
-    p.add_argument("--mode", choices=["buffer", "stream"], default="buffer")
-    p.add_argument("--rle", action="store_true", help="hardware run-length compression")
-    p.add_argument("-t", "--trigger", action="append",
-                   help="trigger, e.g. 0=rising or 0=falling,3=high (types: rising falling high low edge)")
-    p.add_argument("--trigger-pos", type=float, default=1.0, help="pre-trigger buffer in %% (1..90)")
+    p.add_argument("--mode", choices=["buffer", "stream"], help="hardware capture mode (default: buffer)")
+    rle = p.add_mutually_exclusive_group()
+    rle.add_argument("--rle", action="store_true", default=None, help="hardware run-length compression")
+    rle.add_argument("--no-rle", dest="rle", action="store_false", default=None, help="turn off RLE")
+    trigger = p.add_mutually_exclusive_group()
+    trigger.add_argument("-t", "--trigger", action="append",
+                         help="per-channel trigger, e.g. 0=falling,3=high (types: rising falling high low edge)")
+    trigger.add_argument("--no-trigger", dest="trigger", action="store_const", const=[],
+                         help="clear preset trigger conditions")
+    p.add_argument("--trigger-pos", type=float, help="pre-trigger buffer in %% (1..90; default: 1)")
     p.add_argument("--timeout", help="give up after this time, e.g. 10s (default: wait for trigger forever)")
+    p.add_argument("--acquisition", choices=["normal", "immediate", "repeat", "rolling"],
+                   help="capture policy (native rolling is DL32-only)")
+    p.add_argument("--repeat-count", type=int, help="repeat this many times (otherwise until stopped)")
+    p.add_argument("--interval", help="wait after a repeat cycle finishes, e.g. 500ms")
+    p.add_argument("--events", action="store_true", help="write a JSON armed event to stderr")
+    p.add_argument("--stop-file", help="stop when this file appears; it must be absent at startup")
+    p.add_argument("--stop-mode", choices=["abort", "save-received", "upload"],
+                   help="discard on stop or keep received Stream samples (upload is DL32-only)")
     p.add_argument("--pwm", action="append", help="also drive PWM during capture: INDEX:FREQ[:DUTY]")
 
 
@@ -379,7 +553,7 @@ def _add_window_opts(p):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="atk-logic", description="ATK-Logic (ALIENTEK DL16) logic analyzer CLI")
+    ap = argparse.ArgumentParser(prog="atk-logic-cli", description="ATK-Logic (ALIENTEK DL16) logic analyzer CLI")
     ap.add_argument("--version", action="version", version=__version__)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--pretty", action="store_true", help="indent JSON output")
@@ -401,7 +575,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("capture", parents=[common], help="acquire and print a JSON summary")
     _add_capture_opts(sp)
-    sp.add_argument("-o", "--out", action="append", help="save to .vcd/.csv/.atkjson/.json (repeatable)")
+    sp.add_argument("-o", "--out", action="append", help="save to .atkdl/.vcd/.csv/.atkjson/.json (repeatable)")
+    sp.add_argument("--stats", action="store_true", help="also compute edge and timing statistics")
     sp.add_argument("--edges", action="store_true", help="include compact edge/run-length text")
     sp.add_argument("--max-edges", type=int, default=200)
     _add_decode_opts(sp)
@@ -423,7 +598,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("open", parents=[common], help="load a .atkdl/.atkjson file, summarize/export")
     sp.add_argument("file")
     _add_window_opts(sp)
-    sp.add_argument("-o", "--out", action="append", help="export to .vcd/.csv/.atkjson/.json")
+    sp.add_argument("-o", "--out", action="append", help="export to .atkdl/.vcd/.csv/.atkjson/.json")
     sp.add_argument("--edges", action="store_true")
     sp.add_argument("--max-edges", type=int, default=200)
     sp.set_defaults(fn=cmd_open)
@@ -437,7 +612,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("decode", parents=[common], help="run sigrok protocol decoders")
     sp.add_argument("file", nargs="?", help=".atkdl/.atkjson input (omit with --capture)")
     sp.add_argument("--capture", action="store_true", help="capture from the device first")
-    _add_capture_opts(sp, required=False)
+    _add_capture_opts(sp)
     sp.add_argument("-o", "--out", action="append", help="with --capture: also save the capture")
     sp.add_argument("--start", help="window start time")
     sp.add_argument("--end", help="window end time")
@@ -470,12 +645,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _fail(e, EXIT_OTHER, args)
     except (ValueError, KeyError, FileNotFoundError, ImportError) as e:
         return _fail(e, EXIT_USAGE, args)
+    except OSError as e:
+        return _fail(e, EXIT_OTHER, args)
     except KeyboardInterrupt:
         return _fail(RuntimeError("interrupted"), 130, args)
 
 
 def _run_pwm(args) -> int:
-    import time
     from .device import AtkLogic
     log = (lambda m: sys.stderr.write(m + "\n")) if args.verbose else None
     la = AtkLogic.open(index=args.index, log=log)
@@ -515,6 +691,8 @@ def _fail(e: Exception, code: int, args) -> int:
     obj = {"error": str(e), "type": type(e).__name__}
     if hint:
         obj["hint"] = hint
+    if getattr(e, "capture", None) is not None:
+        obj["capture"] = e.capture
     sys.stdout.write(json.dumps(obj, ensure_ascii=False, indent=2 if getattr(args, "pretty", False) else None) + "\n")
     return code
 
